@@ -10,13 +10,15 @@ st.caption("Interactive tool - theory explained in accompanying essay")
 def calculate_realistic_cop(T_outside_C, T_water_C, current_heat_load_kW,
                            humidity=70, include_defrost=True,
                            include_parasitics=True, system_efficiency=50,
-                           include_hex_penalty=True):
+                           include_hex_penalty=True, include_part_load=True,
+                           delta_T_source=7.0, delta_T_sink=4.0):
     """
     Calculate realistic COP accounting for:
-    - Heat exchanger temperature lift
+    - Heat exchanger temperature lift (separate for source and sink)
     - System efficiency (compressor losses)
     - Defrost cycles
     - Parasitic loads (fans, pumps)
+    - Part-load inverter efficiency
     """
 
     # 1. CONVERT TO KELVIN
@@ -24,11 +26,10 @@ def calculate_realistic_cop(T_outside_C, T_water_C, current_heat_load_kW,
     T_water_K = T_water_C + 273.15
 
     # 2. APPLY HEAT EXCHANGER PENALTY (The "Real" Lift)
-    # The refrigerant must be colder than outside and hotter than the water
+    # More realistic: different penalties for source (air) and sink (water)
     if include_hex_penalty:
-        delta_hex = 5.0  # 5 degrees Kelvin penalty (typical for air-to-water)
-        T_evap_K = T_outside_K - delta_hex
-        T_cond_K = T_water_K + delta_hex
+        T_evap_K = T_outside_K - delta_T_source  # Harder to extract from air
+        T_cond_K = T_water_K + delta_T_sink      # Easier to reject to water
     else:
         T_evap_K = T_outside_K
         T_cond_K = T_water_K
@@ -37,27 +38,38 @@ def calculate_realistic_cop(T_outside_C, T_water_C, current_heat_load_kW,
     carnot_cop = T_cond_K / (T_cond_K - T_evap_K)
 
     # 4. SYSTEM EFFICIENCY (Compressor losses, friction, etc)
-    # Usually 45% - 55% of Carnot
     raw_cop = carnot_cop * (system_efficiency / 100)
 
     # 5. DEFROST PENALTY
-    # If it's humid and near freezing, we lose energy melting ice
     defrost_penalty = 1.0
     if include_defrost:
         if -2 <= T_outside_C <= 3 and humidity > 60:
-            # More aggressive defrost needed in high humidity
-            humidity_factor = (humidity - 60) / 40  # 0 to 1
-            defrost_penalty = 0.88 - (0.05 * humidity_factor)  # 12-17% loss
+            humidity_factor = (humidity - 60) / 40
+            defrost_penalty = 0.88 - (0.05 * humidity_factor)
         elif -5 <= T_outside_C <= 5 and humidity > 70:
-            defrost_penalty = 0.90  # 10% loss
+            defrost_penalty = 0.90
 
     raw_cop *= defrost_penalty
 
-    # 6. PARASITIC LOADS (Fans & Pumps)
-    # Fixed power consumption that doesn't scale with heat output
+    # 6. PART-LOAD CORRECTION (Inverter Efficiency)
+    # Estimate load factor based on outdoor temperature
+    inverter_correction = 1.0
+    if include_part_load:
+        design_temp = -10  # 100% load at design condition
+        heating_limit_temp = 15  # No heating needed above 15C
+        load_factor = (heating_limit_temp - T_outside_C) / (heating_limit_temp - design_temp)
+        load_factor = max(0.1, min(1.0, load_factor))  # Clamp between 10% and 100%
+
+        # Polynomial curve: peaks at 50% load, drops at extremes
+        # -0.8x^2 + 0.8x + 0.8
+        inverter_correction = (-0.8 * (load_factor**2)) + (0.8 * load_factor) + 0.8
+
+    raw_cop *= inverter_correction
+
+    # 7. PARASITIC LOADS (Fans & Pumps)
     if include_parasitics and current_heat_load_kW > 0:
         compressor_power_kW = current_heat_load_kW / raw_cop
-        fan_pump_power_kW = 0.150  # 150 Watts fixed load (typical for residential)
+        fan_pump_power_kW = 0.150
 
         total_power_input = compressor_power_kW + fan_pump_power_kW
         real_cop = current_heat_load_kW / total_power_input
@@ -69,6 +81,7 @@ def calculate_realistic_cop(T_outside_C, T_water_C, current_heat_load_kW,
         'carnot_cop': carnot_cop,
         'raw_cop': raw_cop,
         'defrost_penalty': defrost_penalty,
+        'inverter_correction': inverter_correction if include_part_load else 1.0,
         'T_evap': T_evap_K - 273.15,
         'T_cond': T_cond_K - 273.15
     }
@@ -91,6 +104,21 @@ with st.sidebar:
     st.subheader("Model Realism")
 
     include_hex_penalty = st.checkbox("Heat Exchanger Losses", value=True)
+
+    if include_hex_penalty:
+        col1, col2 = st.columns(2)
+        with col1:
+            delta_T_source = st.slider("ΔT Source (°C)", 3.0, 10.0, 7.0, 0.5,
+                                      help="Temperature penalty extracting heat from air")
+        with col2:
+            delta_T_sink = st.slider("ΔT Sink (°C)", 2.0, 8.0, 4.0, 0.5,
+                                    help="Temperature penalty rejecting heat to water")
+    else:
+        delta_T_source = 7.0
+        delta_T_sink = 4.0
+
+    include_part_load = st.checkbox("Part-Load (Inverter)", value=True,
+                                   help="Inverter efficiency varies with load")
     include_defrost = st.checkbox("Defrost Cycles", value=True)
     include_parasitics = st.checkbox("Parasitic Loads", value=True)
 
@@ -114,7 +142,10 @@ result = calculate_realistic_cop(
     include_defrost=include_defrost,
     include_parasitics=include_parasitics,
     system_efficiency=system_efficiency,
-    include_hex_penalty=include_hex_penalty
+    include_hex_penalty=include_hex_penalty,
+    include_part_load=include_part_load,
+    delta_T_source=delta_T_source,
+    delta_T_sink=delta_T_sink
 )
 
 current_cop = result['cop']
@@ -135,7 +166,7 @@ with col3:
 with col4:
     st.metric("Power Draw", f"{electrical_power:.2f} kW")
 
-# Compact status indicator (no emoji as requested earlier)
+# Compact status indicator
 if current_cop >= 3.5:
     st.success(f"Delivering {heat_load:.1f} kW using {electrical_power:.2f} kW (COP = {current_cop:.2f})")
 elif current_cop >= 2.5:
@@ -151,7 +182,10 @@ with st.expander("Detailed Breakdown"):
     st.write("---")
     st.write(f"**Carnot COP:** {carnot_cop:.2f}")
     st.write(f"**System Efficiency:** {system_efficiency}% → COP = {carnot_cop * system_efficiency/100:.2f}")
-    st.write(f"**Defrost Penalty:** {result['defrost_penalty']:.2%} → COP = {raw_cop:.2f}")
+    st.write(f"**Defrost Penalty:** {result['defrost_penalty']:.2%}")
+    if include_part_load:
+        st.write(f"**Inverter Correction:** {result['inverter_correction']:.2%}")
+    st.write(f"**Pre-Parasitic COP:** {raw_cop:.2f}")
 
     if include_parasitics:
         compressor_power = heat_load / raw_cop
@@ -181,7 +215,10 @@ for t in outdoor_range:
         include_defrost=include_defrost,
         include_parasitics=include_parasitics,
         system_efficiency=system_efficiency,
-        include_hex_penalty=include_hex_penalty
+        include_hex_penalty=include_hex_penalty,
+        include_part_load=include_part_load,
+        delta_T_source=delta_T_source,
+        delta_T_sink=delta_T_sink
     )
     carnot_curve.append(result_temp['carnot_cop'])
     ideal_curve.append(result_temp['raw_cop'])
@@ -223,10 +260,13 @@ labels = ["Winter -5°C", "Freezing 0°C", "Mild 7°C", "Spring 12°C"]
 for i, (temp, label) in enumerate(zip(temps, labels)):
     result_temp = calculate_realistic_cop(temp, water_temp, heat_load, humidity,
                                     include_defrost, include_parasitics,
-                                    system_efficiency, include_hex_penalty)
+                                    system_efficiency, include_hex_penalty,
+                                    include_part_load, delta_T_source, delta_T_sink)
     with [col1, col2, col3, col4][i]:
         st.metric(label, f"{result_temp['cop']:.2f}")
 
 # Minimal footer
 st.divider()
 st.caption("Accompanying essay explains: Carnot cycle, system losses, defrost physics, and modeling assumptions")
+
+
