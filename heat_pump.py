@@ -11,7 +11,8 @@ def calculate_realistic_cop(T_outside_C, T_water_C, current_heat_load_kW,
                            humidity=70, include_defrost=True,
                            include_parasitics=True, system_efficiency=50,
                            include_hex_penalty=True, include_part_load=True,
-                           delta_T_source=7.0, delta_T_sink=4.0):
+                           delta_T_source=7.0, delta_T_sink=4.0,
+                           max_capacity_kW=14.0):
     """
     Calculate realistic COP accounting for:
     - Heat exchanger temperature lift (separate for source and sink)
@@ -52,16 +53,16 @@ def calculate_realistic_cop(T_outside_C, T_water_C, current_heat_load_kW,
     raw_cop *= defrost_penalty
 
     # 6. PART-LOAD CORRECTION (Inverter Efficiency)
-    # Estimate load factor based on outdoor temperature
+    # Calculate actual load factor based on demand vs capacity
     inverter_correction = 1.0
     if include_part_load:
-        design_temp = -10  # 100% load at design condition
-        heating_limit_temp = 15  # No heating needed above 15C
-        load_factor = (heating_limit_temp - T_outside_C) / (heating_limit_temp - design_temp)
-        load_factor = max(0.1, min(1.0, load_factor))  # Clamp between 10% and 100%
+        # Load factor: how hard the unit is working (0.0 to 1.0+)
+        load_factor = current_heat_load_kW / max_capacity_kW
+        load_factor = max(0.15, min(1.1, load_factor))  # Clamp: min speed 15%, slight overload 110%
 
         # Polynomial curve: peaks at 50% load, drops at extremes
-        # -0.8x^2 + 0.8x + 0.8
+        # Formula: -0.8x^2 + 0.8x + 0.8
+        # At 50% load -> 1.0 (optimal), at 100% -> 0.8 (friction losses), at 15% -> 0.71 (cycling)
         inverter_correction = (-0.8 * (load_factor**2)) + (0.8 * load_factor) + 0.8
 
     raw_cop *= inverter_correction
@@ -82,6 +83,7 @@ def calculate_realistic_cop(T_outside_C, T_water_C, current_heat_load_kW,
         'raw_cop': raw_cop,
         'defrost_penalty': defrost_penalty,
         'inverter_correction': inverter_correction if include_part_load else 1.0,
+        'load_factor': (current_heat_load_kW / max_capacity_kW) if include_part_load else 1.0,
         'T_evap': T_evap_K - 273.15,
         'T_cond': T_cond_K - 273.15
     }
@@ -98,6 +100,12 @@ with st.sidebar:
     heat_load = st.slider(
         "Heat Demand (kW)",
         1.0, 12.0, 6.0, 0.5
+    )
+
+    max_capacity = st.slider(
+        "Unit Max Capacity (kW)",
+        8.0, 16.0, 14.0, 0.5,
+        help="Rated capacity affects part-load efficiency"
     )
 
     st.divider()
@@ -145,7 +153,8 @@ result = calculate_realistic_cop(
     include_hex_penalty=include_hex_penalty,
     include_part_load=include_part_load,
     delta_T_source=delta_T_source,
-    delta_T_sink=delta_T_sink
+    delta_T_sink=delta_T_sink,
+    max_capacity_kW=max_capacity
 )
 
 current_cop = result['cop']
@@ -184,6 +193,7 @@ with st.expander("Detailed Breakdown"):
     st.write(f"**System Efficiency:** {system_efficiency}% → COP = {carnot_cop * system_efficiency/100:.2f}")
     st.write(f"**Defrost Penalty:** {result['defrost_penalty']:.2%}")
     if include_part_load:
+        st.write(f"**Load Factor:** {result['load_factor']:.1%} ({heat_load:.1f}kW / {max_capacity:.1f}kW)")
         st.write(f"**Inverter Correction:** {result['inverter_correction']:.2%}")
     st.write(f"**Pre-Parasitic COP:** {raw_cop:.2f}")
 
@@ -218,7 +228,8 @@ for t in outdoor_range:
         include_hex_penalty=include_hex_penalty,
         include_part_load=include_part_load,
         delta_T_source=delta_T_source,
-        delta_T_sink=delta_T_sink
+        delta_T_sink=delta_T_sink,
+        max_capacity_kW=max_capacity
     )
     carnot_curve.append(result_temp['carnot_cop'])
     ideal_curve.append(result_temp['raw_cop'])
@@ -261,12 +272,11 @@ for i, (temp, label) in enumerate(zip(temps, labels)):
     result_temp = calculate_realistic_cop(temp, water_temp, heat_load, humidity,
                                     include_defrost, include_parasitics,
                                     system_efficiency, include_hex_penalty,
-                                    include_part_load, delta_T_source, delta_T_sink)
+                                    include_part_load, delta_T_source, delta_T_sink,
+                                    max_capacity)
     with [col1, col2, col3, col4][i]:
         st.metric(label, f"{result_temp['cop']:.2f}")
 
 # Minimal footer
 st.divider()
 st.caption("Accompanying essay explains: Carnot cycle, system losses, defrost physics, and modeling assumptions")
-
-
